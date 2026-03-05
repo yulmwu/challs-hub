@@ -21,6 +21,12 @@ on:
           - amd64
           - multi
 
+      public_repository:
+        description: "Create repository as public (ECR Public)"
+        required: true
+        type: boolean
+        default: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -82,30 +88,37 @@ jobs:
             CONTEXT="$BASE/$(dirname $DOCKERFILE)"
             DOCKERFILE_PATH="$BASE/$DOCKERFILE"
 
-            IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO:${{ github.event.inputs.image_tag }}"
+            if [ "${{ github.event.inputs.public_repository }}" = "true" ]; then
 
-            echo "Processing repository: $REPO"
+              PUBLIC_ALIAS=$(aws ecr-public describe-registry --region us-east-1 --query 'registryAlias' --output text)
 
-            if ! aws ecr describe-repositories --repository-names "$REPO" > /dev/null 2>&1; then
-              echo "ECR repository $REPO does not exist. Creating..."
-              aws ecr create-repository \
-                --repository-name "$REPO" \
-                --image-scanning-configuration scanOnPush=true \
-                --region "$AWS_REGION"
+              IMAGE_URI="public.ecr.aws/$PUBLIC_ALIAS/$REPO:${{ github.event.inputs.image_tag }}"
+
+              if ! aws ecr-public describe-repositories --repository-names "$REPO" --region us-east-1 > /dev/null 2>&1; then
+                echo "Creating PUBLIC ECR repo $REPO"
+                aws ecr-public create-repository \
+                  --repository-name "$REPO" \
+                  --region us-east-1
+              fi
+
             else
-              echo "ECR repository $REPO already exists."
+
+              IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO:${{ github.event.inputs.image_tag }}"
+
+              if ! aws ecr describe-repositories --repository-names "$REPO" > /dev/null 2>&1; then
+                echo "Creating PRIVATE ECR repo $REPO"
+                aws ecr create-repository \
+                  --repository-name "$REPO" \
+                  --image-scanning-configuration scanOnPush=true
+              fi
+
             fi
 
-            echo "Building image $IMAGE_URI"
+            echo "Building $IMAGE_URI"
 
             if [ "${{ github.event.inputs.architecture }}" = "amd64" ]; then
-              docker build \
-                -f "$DOCKERFILE_PATH" \
-                -t "$IMAGE_URI" \
-                "$CONTEXT"
-
+              docker build -f "$DOCKERFILE_PATH" -t "$IMAGE_URI" "$CONTEXT"
               docker push "$IMAGE_URI"
-
             else
               docker buildx build \
                 --platform linux/amd64,linux/arm64 \
