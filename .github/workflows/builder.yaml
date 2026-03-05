@@ -1,0 +1,118 @@
+name: Manifest Docker Build and Push
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "Manifest path (e.g. smctf-demo-admin/manifest.yaml)"
+        required: true
+        type: string
+
+      image_tag:
+        description: "Docker image tag"
+        required: true
+        type: string
+
+      architecture:
+        description: "Build architecture mode"
+        required: true
+        type: choice
+        options:
+          - amd64
+          - multi
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ap-northeast-2
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve manifest info
+        run: |
+          MANIFEST=${{ github.event.inputs.manifest }}
+          BASE=$(yq '.base' $MANIFEST)
+
+          echo "MANIFEST=$MANIFEST" >> $GITHUB_ENV
+          echo "BASE=$BASE" >> $GITHUB_ENV
+
+      - name: Get AWS account id
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        if: ${{ github.event.inputs.architecture == 'multi' }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: ${{ github.event.inputs.architecture == 'multi' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push images
+        run: |
+          COUNT=$(yq '.dockerfiles | length' $MANIFEST)
+
+          for ((i=0;i<COUNT;i++)); do
+            REPO=$(yq ".dockerfiles[$i].repository" $MANIFEST)
+            DOCKERFILE=$(yq ".dockerfiles[$i].dockerfile" $MANIFEST)
+
+            CONTEXT="$BASE/$(dirname $DOCKERFILE)"
+            DOCKERFILE_PATH="$BASE/$DOCKERFILE"
+
+            IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO:${{ github.event.inputs.image_tag }}"
+
+            echo "Processing repository: $REPO"
+
+            if ! aws ecr describe-repositories --repository-names "$REPO" > /dev/null 2>&1; then
+              echo "ECR repository $REPO does not exist. Creating..."
+              aws ecr create-repository \
+                --repository-name "$REPO" \
+                --image-scanning-configuration scanOnPush=true \
+                --region "$AWS_REGION"
+            else
+              echo "ECR repository $REPO already exists."
+            fi
+
+            echo "Building image $IMAGE_URI"
+
+            if [ "${{ github.event.inputs.architecture }}" = "amd64" ]; then
+              docker build \
+                -f "$DOCKERFILE_PATH" \
+                -t "$IMAGE_URI" \
+                "$CONTEXT"
+
+              docker push "$IMAGE_URI"
+
+            else
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                -f "$DOCKERFILE_PATH" \
+                -t "$IMAGE_URI" \
+                --push \
+                "$CONTEXT"
+            fi
+
+          done
