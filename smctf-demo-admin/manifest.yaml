@@ -2,8 +2,6 @@ base: smctf-demo-admin
 dockerfiles:
   - repository: web-bookwish
     dockerfile: web-bookwish/Dockerfile
-  - repository: web-cookie
-    dockerfile: web-cookie/Dockerfile
   - repository: web-simple-note-manager
     dockerfile: web-simple-note-manager/Dockerfile
   - repository: web-xss-filtering-bypass
