@@ -22,110 +22,329 @@ on:
           - multi
 
       public_repository:
-        description: "Create repository as public (ECR Public)"
+        description: "Push to ECR Public instead of private ECR"
         required: true
         type: boolean
         default: false
 
+      auto_create_repository:
+        description: "Automatically create repository if it does not exist"
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: manifest-docker-build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  PUBLIC_ECR_REGION: us-east-1
+
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
-
-    env:
-      AWS_REGION: ap-northeast-2
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
-      - name: Configure AWS credentials
+      - name: Install manifest parser
+        run: |
+          set -Eeuo pipefail
+          python3 -m pip install --quiet pyyaml
+
+      - name: Validate manifest and prepare build plan
+        id: plan
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          import yaml
+
+          repo_root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          manifest_input = os.environ["MANIFEST_PATH"]
+          manifest_path = (repo_root / manifest_input).resolve()
+
+          def fail(msg: str) -> None:
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          try:
+              manifest_path.relative_to(repo_root)
+          except ValueError:
+              fail(f"Manifest path escapes repository root: {manifest_input}")
+
+          if not manifest_path.is_file():
+              fail(f"Manifest file not found: {manifest_input}")
+
+          with manifest_path.open("r", encoding="utf-8") as f:
+              data = yaml.safe_load(f)
+
+          if not isinstance(data, dict):
+              fail("Manifest root must be a YAML object")
+
+          base = data.get("base")
+          if base:
+              base_dir = (repo_root / str(base)).resolve()
+          else:
+              base_dir = manifest_path.parent.resolve()
+
+          try:
+              base_dir.relative_to(repo_root)
+          except ValueError:
+              fail(f"Base path escapes repository root: {base}")
+
+          if not base_dir.is_dir():
+              fail(f"Base directory not found: {base_dir.relative_to(repo_root)}")
+
+          dockerfiles = data.get("dockerfiles")
+          if not isinstance(dockerfiles, list) or not dockerfiles:
+              fail("Manifest must contain a non-empty 'dockerfiles' list")
+
+          build_plan = []
+          seen_repositories = set()
+
+          for idx, item in enumerate(dockerfiles):
+              if not isinstance(item, dict):
+                  fail(f"dockerfiles[{idx}] must be an object")
+
+              repository = item.get("repository")
+              dockerfile_rel = item.get("dockerfile")
+
+              if not isinstance(repository, str) or not repository.strip():
+                  fail(f"dockerfiles[{idx}].repository must be a non-empty string")
+
+              if not isinstance(dockerfile_rel, str) or not dockerfile_rel.strip():
+                  fail(f"dockerfiles[{idx}].dockerfile must be a non-empty string")
+
+              if repository in seen_repositories:
+                  fail(f"Duplicate repository in manifest: {repository}")
+              seen_repositories.add(repository)
+
+              dockerfile_path = (base_dir / dockerfile_rel).resolve()
+              context_path = dockerfile_path.parent.resolve()
+
+              try:
+                  dockerfile_path.relative_to(repo_root)
+                  context_path.relative_to(repo_root)
+              except ValueError:
+                  fail(f"dockerfiles[{idx}] resolves outside repository root: {dockerfile_rel}")
+
+              if not dockerfile_path.is_file():
+                  fail(f"Dockerfile not found: {dockerfile_path.relative_to(repo_root)}")
+
+              build_plan.append(
+                  {
+                      "repository": repository,
+                      "dockerfile_path": str(dockerfile_path),
+                      "context_path": str(context_path),
+                  }
+              )
+
+          plan_file = repo_root / ".manifest-build-plan.json"
+          with plan_file.open("w", encoding="utf-8") as f:
+              json.dump(build_plan, f, indent=2)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              print(f"plan_file={plan_file}", file=out)
+              print(f"count={len(build_plan)}", file=out)
+
+          print(f"Prepared build plan for {len(build_plan)} image(s)")
+          PY
+
+      - name: Configure AWS credentials for private ECR
+        if: ${{ !inputs.public_repository }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ROLE_NAME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
+      - name: Configure AWS credentials for public ECR
+        if: ${{ inputs.public_repository }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ROLE_NAME }}
+          aws-region: ${{ env.PUBLIC_ECR_REGION }}
+
+      - name: Login to private ECR
+        if: ${{ !inputs.public_repository }}
+        id: login-private
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Resolve manifest info
-        run: |
-          MANIFEST=${{ github.event.inputs.manifest }}
-          BASE=$(yq '.base' $MANIFEST)
-
-          echo "MANIFEST=$MANIFEST" >> $GITHUB_ENV
-          echo "BASE=$BASE" >> $GITHUB_ENV
-
-      - name: Get AWS account id
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+      - name: Login to public ECR
+        if: ${{ inputs.public_repository }}
+        id: login-public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
       - name: Set up QEMU
-        if: ${{ github.event.inputs.architecture == 'multi' }}
+        if: ${{ inputs.architecture == 'multi' }}
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Buildx
-        if: ${{ github.event.inputs.architecture == 'multi' }}
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push images
+        env:
+          BUILD_PLAN_FILE: ${{ steps.plan.outputs.plan_file }}
+          BUILD_COUNT: ${{ steps.plan.outputs.count }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          ARCHITECTURE: ${{ inputs.architecture }}
+          PUBLIC_REPOSITORY: ${{ inputs.public_repository }}
+          AUTO_CREATE_REPOSITORY: ${{ inputs.auto_create_repository }}
+          PRIVATE_REGISTRY: ${{ steps.login-private.outputs.registry }}
+          GIT_SHA: ${{ github.sha }}
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          COUNT=$(yq '.dockerfiles | length' $MANIFEST)
+          set -Eeuo pipefail
 
-          for ((i=0;i<COUNT;i++)); do
-            REPO=$(yq ".dockerfiles[$i].repository" $MANIFEST)
-            DOCKERFILE=$(yq ".dockerfiles[$i].dockerfile" $MANIFEST)
+          if [ ! -f "$BUILD_PLAN_FILE" ]; then
+            echo "::error::Build plan file not found: $BUILD_PLAN_FILE"
+            exit 1
+          fi
 
-            CONTEXT="$BASE/$(dirname $DOCKERFILE)"
-            DOCKERFILE_PATH="$BASE/$DOCKERFILE"
+          if [ "$BUILD_COUNT" = "0" ]; then
+            echo "::error::No docker entries found in manifest"
+            exit 1
+          fi
 
-            if [ "${{ github.event.inputs.public_repository }}" = "true" ]; then
+          if [ "$ARCHITECTURE" = "multi" ]; then
+            PLATFORMS="linux/amd64,linux/arm64"
+          else
+            PLATFORMS="linux/amd64"
+          fi
 
-              PUBLIC_ALIAS=$(aws ecr-public describe-registry --region us-east-1 --query 'registryAlias' --output text)
+          ensure_private_repo() {
+            local repo="$1"
 
-              IMAGE_URI="public.ecr.aws/$PUBLIC_ALIAS/$REPO:${{ github.event.inputs.image_tag }}"
-
-              if ! aws ecr-public describe-repositories --repository-names "$REPO" --region us-east-1 > /dev/null 2>&1; then
-                echo "Creating PUBLIC ECR repo $REPO"
-                aws ecr-public create-repository \
-                  --repository-name "$REPO" \
-                  --region us-east-1
-              fi
-
-            else
-
-              IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO:${{ github.event.inputs.image_tag }}"
-
-              if ! aws ecr describe-repositories --repository-names "$REPO" > /dev/null 2>&1; then
-                echo "Creating PRIVATE ECR repo $REPO"
-                aws ecr create-repository \
-                  --repository-name "$REPO" \
-                  --image-scanning-configuration scanOnPush=true
-              fi
-
+            if aws ecr describe-repositories \
+              --region "$AWS_REGION" \
+              --repository-names "$repo" >/dev/null 2>&1; then
+              return 0
             fi
 
-            echo "Building $IMAGE_URI"
-
-            if [ "${{ github.event.inputs.architecture }}" = "amd64" ]; then
-              docker build -f "$DOCKERFILE_PATH" -t "$IMAGE_URI" "$CONTEXT"
-              docker push "$IMAGE_URI"
-            else
-              docker buildx build \
-                --platform linux/amd64,linux/arm64 \
-                -f "$DOCKERFILE_PATH" \
-                -t "$IMAGE_URI" \
-                --push \
-                "$CONTEXT"
+            if [ "$AUTO_CREATE_REPOSITORY" != "true" ]; then
+              echo "::error::Private ECR repository does not exist: $repo"
+              exit 1
             fi
 
-          done
+            echo "Creating private ECR repository: $repo"
+            aws ecr create-repository \
+              --region "$AWS_REGION" \
+              --repository-name "$repo" \
+              --image-scanning-configuration scanOnPush=true >/dev/null
+          }
+
+          ensure_public_repo() {
+            local repo="$1"
+
+            if aws ecr-public describe-repositories \
+              --region "$PUBLIC_ECR_REGION" \
+              --repository-names "$repo" >/dev/null 2>&1; then
+              return 0
+            fi
+
+            if [ "$AUTO_CREATE_REPOSITORY" != "true" ]; then
+              echo "::error::Public ECR repository does not exist: $repo"
+              exit 1
+            fi
+
+            echo "Creating public ECR repository: $repo"
+            aws ecr-public create-repository \
+              --region "$PUBLIC_ECR_REGION" \
+              --repository-name "$repo" >/dev/null
+          }
+
+          get_public_registry_uri() {
+            aws ecr-public describe-registries \
+              --region "$PUBLIC_ECR_REGION" \
+              --query 'registries[0].registryUri' \
+              --output text
+          }
+
+          while IFS=$'\t' read -r REPO_NAME DOCKERFILE_PATH CONTEXT_PATH; do
+            echo "----------------------------------------"
+            echo "Repository : $REPO_NAME"
+            echo "Dockerfile : $DOCKERFILE_PATH"
+            echo "Context    : $CONTEXT_PATH"
+
+            if [ "$PUBLIC_REPOSITORY" = "true" ]; then
+              ensure_public_repo "$REPO_NAME"
+
+              PUBLIC_REGISTRY_URI="$(get_public_registry_uri)"
+              if [ -z "$PUBLIC_REGISTRY_URI" ] || [ "$PUBLIC_REGISTRY_URI" = "None" ]; then
+                echo "::error::Failed to resolve public registry URI after repository creation"
+                exit 1
+              fi
+
+              IMAGE_URI="${PUBLIC_REGISTRY_URI}/${REPO_NAME}:${IMAGE_TAG}"
+            else
+              ensure_private_repo "$REPO_NAME"
+
+              if [ -z "$PRIVATE_REGISTRY" ]; then
+                echo "::error::Private registry output is empty"
+                exit 1
+              fi
+
+              IMAGE_URI="${PRIVATE_REGISTRY}/${REPO_NAME}:${IMAGE_TAG}"
+            fi
+
+            CACHE_SCOPE="$(echo "$REPO_NAME" | tr '/._' '---')"
+
+            echo "Image URI  : $IMAGE_URI"
+            echo "Platforms  : $PLATFORMS"
+            echo "CacheScope : $CACHE_SCOPE"
+
+            docker buildx build \
+              --platform "$PLATFORMS" \
+              --file "$DOCKERFILE_PATH" \
+              --tag "$IMAGE_URI" \
+              --label "org.opencontainers.image.source=$REPOSITORY_URL" \
+              --label "org.opencontainers.image.revision=$GIT_SHA" \
+              --cache-from "type=gha,scope=$CACHE_SCOPE" \
+              --cache-to "type=gha,mode=max,scope=$CACHE_SCOPE" \
+              --pull \
+              --push \
+              "$CONTEXT_PATH"
+          done < <(
+            python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["BUILD_PLAN_FILE"], "r", encoding="utf-8") as f:
+              plan = json.load(f)
+
+          for item in plan:
+              print(f"{item['repository']}\t{item['dockerfile_path']}\t{item['context_path']}")
+          PY
+          )
+
+      - name: Summary
+        run: |
+          {
+            echo "### Manifest build completed"
+            echo
+            echo "- Manifest: \`${{ inputs.manifest }}\`"
+            echo "- Image tag: \`${{ inputs.image_tag }}\`"
+            echo "- Architecture: \`${{ inputs.architecture }}\`"
+            echo "- Public repository: \`${{ inputs.public_repository }}\`"
+            echo "- Auto create repository: \`${{ inputs.auto_create_repository }}\`"
+            echo "- Images processed: \`${{ steps.plan.outputs.count }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
